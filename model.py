@@ -25,12 +25,12 @@ class Model:
     def create_gpu_resources(self, gl: moderngl.Context, program):
         """
         Create VBO/IBO/VAO and upload textures. Assumes vertex layout: position(3), normal(3), uv(2).
-        If a mesh has no texture reference, a 1x1 flat gray texture is created and used.
+        Now loads multiple texture types: base color, normal map, roughness/metallic.
         """
         self.vbos = []
         self.ibos = []
         self.vaos = []
-        self.samplers = []
+        self.samplers = []  # Will store dict of samplers: {'baseColor': sampler, 'normal': sampler, ...}
 
         for i, (geom, idx) in enumerate(zip(self.geom_list, self.index_list)):
             # Ensure numpy arrays of correct dtype
@@ -41,24 +41,54 @@ class Model:
             ibo = gl.buffer(indices.tobytes())
             vao = gl.vertex_array(program, [(vbo, '3f 3f 2f', 'position', 'normal', 'uv')], ibo)
 
-            # Texture / sampler
+            # Load all texture types
             tex_ref = self.tex_refs[i] if i < len(self.tex_refs) else None
-            sampler = None
-            if self._loader is not None:
-                sampler = self._loader.load_texture(tex_ref, gl)
+            samplers_dict = {}
+            
+            if self._loader is not None and tex_ref:
+                # tex_ref is now a dict: {'baseColor': path, 'normal': path, etc.}
+                if isinstance(tex_ref, dict):
+                    for tex_type, tex_path in tex_ref.items():
+                        try:
+                            sampler = self._loader.load_texture(tex_path, gl)
+                            if sampler:
+                                samplers_dict[tex_type] = sampler
+                        except Exception as e:
+                            print(f"Warning: Failed to load {tex_type} texture: {e}")
+                else:
+                    # Fallback: old format (single texture)
+                    sampler = self._loader.load_texture(tex_ref, gl)
+                    if sampler:
+                        samplers_dict['baseColor'] = sampler
 
-            # create flat gray texture if loader did not provide one
-            if sampler is None:
+            # Create default textures for missing types
+            if 'baseColor' not in samplers_dict:
                 gray = bytes([128, 128, 128, 255])  # 1x1 RGBA
                 tex = gl.texture((1, 1), 4, gray)
                 tex.build_mipmaps()
-                sampler = gl.sampler(texture=tex, filter=(moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR),
+                samplers_dict['baseColor'] = gl.sampler(texture=tex, filter=(moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR),
+                                     repeat_x=True, repeat_y=True)
+            
+            if 'normal' not in samplers_dict:
+                # Default normal map (flat: 0.5, 0.5, 1.0 in RGB = up in tangent space)
+                normal_default = bytes([128, 128, 255, 255])  # 1x1 RGBA
+                tex = gl.texture((1, 1), 4, normal_default)
+                tex.build_mipmaps()
+                samplers_dict['normal'] = gl.sampler(texture=tex, filter=(moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR),
+                                     repeat_x=True, repeat_y=True)
+            
+            if 'roughness' not in samplers_dict and 'metallic' not in samplers_dict:
+                # Default roughness (0.5) and metallic (0.0) - combined
+                rough_metal = bytes([128, 0, 0, 255])  # R=roughness, G=metallic
+                tex = gl.texture((1, 1), 4, rough_metal)
+                tex.build_mipmaps()
+                samplers_dict['roughness'] = gl.sampler(texture=tex, filter=(moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR),
                                      repeat_x=True, repeat_y=True)
 
             self.vbos.append(vbo)
             self.ibos.append(ibo)
             self.vaos.append(vao)
-            self.samplers.append(sampler)
+            self.samplers.append(samplers_dict)  # Now a dict instead of single sampler
 
     @staticmethod
     def load_from_file(filepath):
@@ -75,6 +105,11 @@ class Model:
         model.geom_list = loader.geom_list          # flattened float32 arrays (pos3, norm3, uv2)
         model.index_list = loader.index_list        # int32 index arrays
         model.tex_refs = loader.tex_names           # per-mesh texture reference (path, ("embedded", data), or None)
+        model.file_path = filepath                  # Store for duplication
+        
+        # Extract filename as default name
+        import os
+        model.name = os.path.splitext(os.path.basename(filepath))[0]
 
         # attempt to expose material list if available
         try:
@@ -118,17 +153,49 @@ class Model:
 
         out vec4 fragColor;
 
-        uniform sampler2D map;
+        uniform sampler2D map;              // Base color / albedo
+        uniform sampler2D normalMap;        // Normal map
+        uniform sampler2D roughnessMap;     // Roughness (R channel) / Metallic (G channel)
         uniform vec4 light;
         uniform vec3 view_pos;
         uniform vec3 diff_reflectance;
         uniform vec3 specular_color;
         uniform float shininess;
+        uniform bool useNormalMap;          // Toggle normal mapping
+        uniform bool useRoughnessMap;       // Toggle roughness mapping
+
+        // Simple normal mapping without tangent space (approximation)
+        vec3 perturbNormal(vec3 N, vec3 V, vec2 texcoord) {
+            // Sample normal map
+            vec3 normalTex = texture(normalMap, texcoord).rgb * 2.0 - 1.0;
+            
+            // Derive tangent space from position derivatives
+            vec3 dp1 = dFdx(v_fragpos);
+            vec3 dp2 = dFdy(v_fragpos);
+            vec2 duv1 = dFdx(texcoord);
+            vec2 duv2 = dFdy(texcoord);
+            
+            vec3 dp2perp = cross(dp2, N);
+            vec3 dp1perp = cross(N, dp1);
+            vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+            vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+            
+            float invmax = inversesqrt(max(dot(T,T), dot(B,B)));
+            mat3 TBN = mat3(T * invmax, B * invmax, N);
+            
+            return normalize(TBN * normalTex);
+        }
 
         void main() {
             vec3 normal = normalize(v_normal);
+            vec3 view_dir = normalize(view_pos - v_fragpos);
+            
+            // Apply normal mapping if enabled
+            if (useNormalMap) {
+                normal = perturbNormal(normal, view_dir, v_texcoord);
+            }
 
-            // compute light direction (point vs directional)
+            // Compute light direction (point vs directional)
             vec3 light_dir;
             if (light.w == 1.0) {
                 light_dir = normalize(light.xyz - v_fragpos);
@@ -136,21 +203,32 @@ class Model:
                 light_dir = normalize(light.xyz);
             }
 
-            // albedo
+            // Albedo from base color texture
             vec4 albedo = texture(map, v_texcoord);
             vec3 mat_color = albedo.rgb;
 
-            // diffuse
+            // Sample roughness/metallic if enabled
+            float roughness = 0.5;
+            float metallic = 0.0;
+            if (useRoughnessMap) {
+                vec4 roughMetalSample = texture(roughnessMap, v_texcoord);
+                roughness = roughMetalSample.r;  // R channel = roughness
+                metallic = roughMetalSample.g;   // G channel = metallic (if present)
+            }
+            
+            // Convert roughness to shininess (inverse relationship)
+            float adjustedShininess = shininess * (1.0 - roughness * 0.9);
+
+            // Diffuse
             float diff = max(dot(normal, light_dir), 0.0);
             vec3 diffuse = diff * diff_reflectance * mat_color;
 
-            // specular (Blinn-Phong)
-            vec3 view_dir = normalize(view_pos - v_fragpos);
+            // Specular (Blinn-Phong with roughness adjustment)
             vec3 half_vector = normalize(light_dir + view_dir);
-            float spec = pow(max(dot(normal, half_vector), 0.0), shininess);
-            vec3 specular = spec * specular_color;
+            float spec = pow(max(dot(normal, half_vector), 0.0), adjustedShininess);
+            vec3 specular = spec * specular_color * (1.0 - roughness * 0.7);
 
-            // ambient
+            // Ambient
             vec3 ambient = vec3(0.1) * mat_color;
 
             vec3 color = ambient + diffuse + specular;

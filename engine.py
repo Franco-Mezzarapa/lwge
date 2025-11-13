@@ -5,6 +5,7 @@ import pygame
 import moderngl
 import glm
 import model
+from skybox import Skybox
 
 #   Orbit:       MMB drag
 #   Pan:         Shift + MMB drag
@@ -14,7 +15,7 @@ import model
 #                Zoom in/out (Ctrl + Up/Down)
 # Elevation clamped to avoid flipping; zoom distance clamped.
 class Engine:
-    def __init__(self, width=800, height=600, title="LWGE Engine"):
+    def __init__(self, width=800, height=600, title="LWGE Engine", control_panel=None):
         pygame.init()
         self.width = width
         self.height = height
@@ -31,6 +32,18 @@ class Engine:
         self.models = []
         self.default_program = None
         
+        # Skybox
+        self.skybox = Skybox(self.gl)
+        
+        # Model selection and manipulation
+        self.selected_model = None
+        self.transform_mode = None  # None, 'move', 'rotate', 'scale'
+        self.transform_active = False  # True when in modal transform (after pressing G/R/S)
+        self.transform_axis_constraint = None  # None, 'X', 'Y', 'Z'
+        self.transform_start_mouse = None
+        self.transform_start_value = None  # Store original transform
+        self.control_panel = control_panel
+        
         # camera and lighting
         self.camera = None
         self.lights = []
@@ -43,14 +56,26 @@ class Engine:
         self.camera_azimuth = 0.0  # horizontal rotation angle
         self.camera_elevation = 20.0  # vertical rotation angle (degrees)
         self.camera_distance = 10.0  # distance from center
-        self.camera_pan_speed = 0.5  # units per arrow key press
+        self.camera_pan_speed = 1.0  # units per arrow key press (increased from 0.5)
         # Sensitivities (tuned for a 800x600 window; scale independent math used for pan)
         self.orbit_sensitivity = 0.3   # deg per pixel
-        self.pan_sensitivity = 1.0     # scalar applied to world-per-pixel pan
+        self.pan_sensitivity = 1.5     # scalar applied to world-per-pixel pan (increased from 1.0)
         self.zoom_sensitivity = 0.08   # dolly factor per pixel
-        self.min_camera_distance = 0.2
-        self.max_camera_distance = 1000.0
+        self.min_camera_distance = 0.1  # decreased from 0.2 for closer views
+        self.max_camera_distance = 5000.0  # increased from 1000 for larger scenes
         self.orbit_key_step = 3.0  # degrees per arrow key press when orbiting
+        
+        # Custom cursors for different modes
+        self.cursors = {
+            'normal': pygame.SYSTEM_CURSOR_ARROW,
+            'move': pygame.SYSTEM_CURSOR_SIZEALL,
+            'rotate': pygame.SYSTEM_CURSOR_CROSSHAIR,
+            'scale': pygame.SYSTEM_CURSOR_SIZENWSE,
+            'delete': pygame.SYSTEM_CURSOR_NO
+        }
+        self.current_cursor = 'normal'
+        pygame.mouse.set_cursor(self.cursors['normal'])
+        self.control_panel = control_panel
         
         # Initialize default shader program
         self._initialize_default_shader()
@@ -162,6 +187,33 @@ class Engine:
     def clear_lights(self):
         """Remove all lights from the scene."""
         self.lights = []
+    
+    def load_skybox_cubemap(self, image_paths):
+        """Load a cubemap skybox from 6 images.
+        
+        Parameters:
+        - image_paths: dict with keys 'right', 'left', 'top', 'bottom', 'front', 'back'
+                      OR list of 6 paths in that order
+        """
+        try:
+            self.skybox.load_cubemap(image_paths)
+        except Exception as e:
+            print(f"Error loading cubemap skybox: {e}")
+    
+    def load_skybox_equirectangular(self, image_path):
+        """Load an equirectangular skybox from a single image.
+        
+        Parameters:
+        - image_path: path to equirectangular image (.hdr, .jpg, .png, etc.)
+        """
+        try:
+            self.skybox.load_equirectangular(image_path)
+        except Exception as e:
+            print(f"Error loading equirectangular skybox: {e}")
+    
+    def clear_skybox(self):
+        """Remove current skybox"""
+        self.skybox.clear()
 
     # General pygame resize handler.
     def resize(self, width, height):
@@ -294,25 +346,33 @@ class Engine:
                     return
             else:
                 # No modifiers: Pan camera center (forward/back/left/right relative to view)
+                # Use camera position to center vector for accurate direction
                 forward = glm.normalize(self.camera['center'] - self.camera['pos'])
+                # Calculate right vector perpendicular to forward and up
                 right = glm.normalize(glm.cross(forward, self.camera['up']))
                 pan_amount = self.camera_pan_speed
                 
                 if key == pygame.K_LEFT:
+                    # Pan left: move camera center to the left relative to view
                     self.camera['center'] -= right * pan_amount
                     self.update_camera_view()
                 elif key == pygame.K_RIGHT:
+                    # Pan right: move camera center to the right relative to view
                     self.camera['center'] += right * pan_amount
                     self.update_camera_view()
                 elif key == pygame.K_UP:
                     # Move forward along the camera's view direction (projected to horizontal plane)
-                    forward_horizontal = glm.normalize(glm.vec3(forward.x, 0.0, forward.z))
-                    self.camera['center'] += forward_horizontal * pan_amount
+                    forward_horizontal = glm.vec3(forward.x, 0.0, forward.z)
+                    if glm.length(forward_horizontal) > 0.001:  # Avoid division by zero
+                        forward_horizontal = glm.normalize(forward_horizontal)
+                        self.camera['center'] += forward_horizontal * pan_amount
                     self.update_camera_view()
                 elif key == pygame.K_DOWN:
                     # Move backward along the camera's view direction (projected to horizontal plane)
-                    forward_horizontal = glm.normalize(glm.vec3(forward.x, 0.0, forward.z))
-                    self.camera['center'] -= forward_horizontal * pan_amount
+                    forward_horizontal = glm.vec3(forward.x, 0.0, forward.z)
+                    if glm.length(forward_horizontal) > 0.001:  # Avoid division by zero
+                        forward_horizontal = glm.normalize(forward_horizontal)
+                        self.camera['center'] -= forward_horizontal * pan_amount
                     self.update_camera_view()
 
 
@@ -372,6 +432,64 @@ class Engine:
         except ValueError:
             pass
     
+    def duplicate_model(self, model_to_duplicate):
+        """Duplicate a model instance with a slight offset.
+        
+        Creates a new Model instance with the same mesh data and textures,
+        but with a new transform. Places it slightly offset from the original.
+        """
+        if model_to_duplicate is None:
+            return None
+        
+        # Create new model from the same file path if available
+        if hasattr(model_to_duplicate, 'file_path') and model_to_duplicate.file_path:
+            new_model = model.Model.load_from_file(model_to_duplicate.file_path)
+        else:
+            # If no file path, we need to manually copy the data (more complex)
+            # For now, return None - we'll need the file path
+            print("Cannot duplicate model without file_path attribute")
+            return None
+        
+        # Copy the transform from the original
+        if hasattr(model_to_duplicate, 'model_matrix'):
+            new_model.model_matrix = glm.mat4(model_to_duplicate.model_matrix)
+        else:
+            new_model.model_matrix = glm.mat4(1.0)
+        
+        # Offset the duplicate slightly (2 units to the right)
+        offset = glm.vec3(2.0, 0.0, 0.0)
+        new_model.model_matrix = glm.translate(new_model.model_matrix, offset)
+        
+        # Copy position, rotation, scale if they exist
+        if hasattr(model_to_duplicate, 'position'):
+            new_model.position = glm.vec3(model_to_duplicate.position) + offset
+        if hasattr(model_to_duplicate, 'rotation'):
+            new_model.rotation = glm.vec3(model_to_duplicate.rotation)
+        if hasattr(model_to_duplicate, 'scale'):
+            new_model.scale = glm.vec3(model_to_duplicate.scale)
+        
+        # Generate a unique name
+        base_name = getattr(model_to_duplicate, 'name', 'Model')
+        # Find existing duplicates to number properly
+        counter = 1
+        new_name = f"{base_name}.{counter:03d}"
+        while any(getattr(m, 'name', None) == new_name for m in self.models):
+            counter += 1
+            new_name = f"{base_name}.{counter:03d}"
+        new_model.name = new_name
+        
+        # Add to scene with same program
+        program_to_use = getattr(model_to_duplicate, 'program', None)
+        if program_to_use:
+            new_model.create_gpu_resources(self.gl, program_to_use)
+            new_model.program = program_to_use
+        else:
+            self.add_model(new_model)
+            return new_model
+        
+        self.models.append(new_model)
+        return new_model
+    
     def render(self, camera=None, lights=None, shadow_map=None):
         """
         Render the scene using the provided camera and lights.
@@ -397,6 +515,10 @@ class Engine:
         cam_view = camera.get('view') if isinstance(camera, dict) else getattr(camera, 'view', None)
         cam_persp = camera.get('perspective') if isinstance(camera, dict) else getattr(camera, 'perspective', None)
         cam_pos = camera.get('pos') if isinstance(camera, dict) else getattr(camera, 'pos', None)
+
+        # Render skybox first (if present)
+        if self.skybox and self.skybox.texture is not None:
+            self.skybox.render(cam_persp, cam_view)
 
         # Precompute bytes for view/perspective to avoid realloc each draw
         view_bytes = numpy.array(cam_view.to_list(), dtype='f4').tobytes() if cam_view is not None else None
@@ -463,21 +585,76 @@ class Engine:
             # Now draw each mesh in the model
             # Each model.meshes corresponds to a VAO/sampler/material set created in create_gpu_resources
             for vao, sampler, material in zip(m.vaos, m.samplers, getattr(m, 'materials', [])):
-                # bind texture sampler to unit 0 (shader should expect map at unit 0)
+                # Bind texture samplers - now sampler can be a dict of multiple samplers
                 try:
                     if sampler is not None:
-                        sampler.use(location=0)
-                    else:
-                        # if no sampler, shader should still sample a bound texture unit; skip if none
+                        # Check if sampler is a dict (new multi-texture format)
+                        if isinstance(sampler, dict):
+                            # Bind base color texture to unit 0
+                            if 'baseColor' in sampler and sampler['baseColor'] is not None:
+                                sampler['baseColor'].use(location=0)
+                                prog['map'].value = 0
+                            
+                            # Bind normal map to unit 1
+                            if 'normal' in sampler and sampler['normal'] is not None:
+                                sampler['normal'].use(location=1)
+                                prog['normalMap'].value = 1
+                                try:
+                                    prog['useNormalMap'].value = True
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    prog['useNormalMap'].value = False
+                                except Exception:
+                                    pass
+                            
+                            # Bind roughness/metallic map to unit 2
+                            if 'roughness' in sampler and sampler['roughness'] is not None:
+                                sampler['roughness'].use(location=2)
+                                prog['roughnessMap'].value = 2
+                                try:
+                                    prog['useRoughnessMap'].value = True
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    prog['useRoughnessMap'].value = False
+                                except Exception:
+                                    pass
+                        else:
+                            # Legacy single sampler format (backwards compatibility)
+                            sampler.use(location=0)
+                            prog['map'].value = 0
+                            try:
+                                prog['useNormalMap'].value = False
+                                prog['useRoughnessMap'].value = False
+                            except Exception:
+                                pass
+                except Exception as e:
+                    # Fallback: disable advanced features
+                    try:
+                        prog['useNormalMap'].value = False
+                        prog['useRoughnessMap'].value = False
+                    except Exception:
                         pass
-                except Exception:
-                    pass
 
                 # set material uniforms if present (diffuse/specular/shininess)
                 if material is not None:
                     try:
-                        if 'diffuse' in material:
+                        # Highlight selected model with a color tint
+                        if m == self.selected_model:
+                            # Add orange/yellow highlight tint to selected model
+                            base_diffuse = material.get('diffuse', (1.0, 1.0, 1.0))
+                            highlighted = (
+                                min(1.0, base_diffuse[0] * 1.3 + 0.3),
+                                min(1.0, base_diffuse[1] * 1.2 + 0.2),
+                                min(1.0, base_diffuse[2] * 0.8)
+                            )
+                            prog['diff_reflectance'].value = highlighted
+                        elif 'diffuse' in material:
                             prog['diff_reflectance'].value = material['diffuse']
+                        
                         if 'shininess' in material:
                             prog['shininess'].value = material['shininess']
                         if 'specular' in material:
@@ -495,3 +672,319 @@ class Engine:
                 except Exception:
                     # drawing failed for this vao; continue with next
                     continue
+
+    def ray_from_mouse(self, mouse_x, mouse_y):
+        """Convert mouse coordinates to a ray in world space for picking"""
+        if self.camera is None:
+            return None, None
+        
+        # Convert screen coordinates to NDC (Normalized Device Coordinates)
+        x = (2.0 * mouse_x) / self.width - 1.0
+        y = 1.0 - (2.0 * mouse_y) / self.height
+        
+        # Ray in clip space
+        ray_clip = glm.vec4(x, y, -1.0, 1.0)
+        
+        # Convert to eye space
+        ray_eye = glm.inverse(self.camera['perspective']) * ray_clip
+        ray_eye = glm.vec4(ray_eye.x, ray_eye.y, -1.0, 0.0)
+        
+        # Convert to world space
+        ray_world = glm.vec3(glm.inverse(self.camera['view']) * ray_eye)
+        ray_world = glm.normalize(ray_world)
+        
+        return self.camera['pos'], ray_world
+    
+    def ray_intersects_sphere(self, ray_origin, ray_dir, center, radius):
+        """Check if ray intersects a bounding sphere"""
+        oc = ray_origin - center
+        a = glm.dot(ray_dir, ray_dir)
+        b = 2.0 * glm.dot(oc, ray_dir)
+        c = glm.dot(oc, oc) - radius * radius
+        discriminant = b * b - 4 * a * c
+        
+        if discriminant < 0:
+            return False, float('inf')
+        else:
+            t = (-b - math.sqrt(discriminant)) / (2.0 * a)
+            return True, t
+    
+    def pick_model(self, mouse_x, mouse_y):
+        """Pick a model at the given mouse coordinates"""
+        ray_origin, ray_dir = self.ray_from_mouse(mouse_x, mouse_y)
+        
+        if ray_origin is None or ray_dir is None:
+            return None
+        
+        closest_model = None
+        closest_distance = float('inf')
+        
+        for m in self.models:
+            # Get model position (center of bounds or model matrix translation)
+            model_mat = getattr(m, 'model_matrix', glm.mat4(1.0))
+            model_pos = glm.vec3(model_mat[3])
+            
+            # Get bounding sphere radius
+            bounds = getattr(m, 'bounds', None)
+            if bounds:
+                # bounds is a SceneBound object with boundingBox, center, and radius
+                if hasattr(bounds, 'radius'):
+                    radius = bounds.radius / 2.0
+                elif hasattr(bounds, 'boundingBox'):
+                    # Calculate from boundingBox
+                    bbox = bounds.boundingBox
+                    radius = glm.length(bbox[1] - bbox[0]) / 2.0
+                else:
+                    radius = 1.0
+            else:
+                radius = 1.0  # default radius
+            
+            # Check ray-sphere intersection
+            hit, distance = self.ray_intersects_sphere(ray_origin, ray_dir, model_pos, radius)
+            
+            if hit and distance < closest_distance:
+                closest_distance = distance
+                closest_model = m
+        
+        return closest_model
+    
+    def delete_selected_model(self):
+        """Delete the currently selected model"""
+        if self.selected_model and self.selected_model in self.models:
+            self.models.remove(self.selected_model)
+            self.selected_model = None
+            print("Model deleted")
+            return True
+        return False
+    
+    def start_transform(self, mode):
+        """Start a modal transform operation (G/R/S keys)"""
+        if self.selected_model is None:
+            print("No model selected")
+            return False
+        
+        self.transform_mode = mode
+        self.transform_active = True
+        self.transform_axis_constraint = None
+        self.transform_start_mouse = pygame.mouse.get_pos()
+        
+        # Store the starting state
+        if not hasattr(self.selected_model, 'model_matrix'):
+            self.selected_model.model_matrix = glm.mat4(1.0)
+        
+        # Store original matrix
+        self.transform_start_value = glm.mat4(self.selected_model.model_matrix)
+        
+        # Update cursor
+        cursor = self.cursors.get(mode, self.cursors['normal'])
+        pygame.mouse.set_cursor(cursor)
+        
+        print(f"Transform {mode} started - Move mouse, press X/Y/Z for axis, Enter to confirm, ESC to cancel")
+        return True
+    
+    def set_axis_constraint(self, axis):
+        """Constrain transform to specific axis (X/Y/Z)"""
+        if self.transform_active:
+            self.transform_axis_constraint = axis
+            print(f"Transform constrained to {axis} axis")
+    
+    def cancel_transform(self):
+        """Cancel the current transform and restore original state"""
+        if self.transform_active and self.selected_model and self.transform_start_value:
+            self.selected_model.model_matrix = glm.mat4(self.transform_start_value)
+            print("Transform cancelled")
+        
+        self.transform_active = False
+        self.transform_mode = None
+        self.transform_axis_constraint = None
+        self.transform_start_mouse = None
+        self.transform_start_value = None
+        pygame.mouse.set_cursor(self.cursors['normal'])
+    
+    def confirm_transform(self):
+        """Confirm the current transform"""
+        if self.transform_active:
+            print(f"Transform {self.transform_mode} confirmed")
+        
+        self.transform_active = False
+        self.transform_mode = None
+        self.transform_axis_constraint = None
+        self.transform_start_mouse = None
+        self.transform_start_value = None
+        pygame.mouse.set_cursor(self.cursors['normal'])
+    
+    def update_transform(self, mouse_x, mouse_y):
+        """Update the transform based on mouse movement"""
+        if not self.transform_active or not self.selected_model or not self.transform_start_mouse:
+            return
+        
+        # Calculate mouse delta
+        dx = (mouse_x - self.transform_start_mouse[0]) * 0.01
+        dy = (mouse_y - self.transform_start_mouse[1]) * 0.01
+        
+        # Reset to original state
+        self.selected_model.model_matrix = glm.mat4(self.transform_start_value)
+        
+        # Get camera vectors
+        forward = glm.normalize(self.camera['center'] - self.camera['pos'])
+        right = glm.normalize(glm.cross(forward, self.camera['up']))
+        up = glm.vec3(0, 1, 0)  # World up
+        
+        if self.transform_mode == 'move':
+            # Translation
+            if self.transform_axis_constraint == 'X':
+                # Move only along world X axis
+                offset = glm.vec3(dx * 10, 0, 0)
+            elif self.transform_axis_constraint == 'Y':
+                # Move only along world Y axis
+                offset = glm.vec3(0, -dy * 10, 0)
+            elif self.transform_axis_constraint == 'Z':
+                # Move only along world Z axis
+                offset = glm.vec3(0, 0, dx * 10)
+            else:
+                # Free movement in camera plane
+                offset = right * dx * 10 - up * dy * 10
+            
+            self.selected_model.model_matrix = glm.translate(self.selected_model.model_matrix, offset)
+        
+        elif self.transform_mode == 'rotate':
+            # Rotation
+            angle = dx * 100.0  # degrees
+            
+            if self.transform_axis_constraint == 'X':
+                axis = glm.vec3(1, 0, 0)
+            elif self.transform_axis_constraint == 'Y':
+                axis = glm.vec3(0, 1, 0)
+            elif self.transform_axis_constraint == 'Z':
+                axis = glm.vec3(0, 0, 1)
+            else:
+                # Default to Y axis (like Blender)
+                axis = glm.vec3(0, 1, 0)
+            
+            # Get model center
+            model_pos = glm.vec3(self.selected_model.model_matrix[3])
+            
+            # Rotate around model's center
+            self.selected_model.model_matrix = glm.translate(glm.mat4(1.0), model_pos)
+            self.selected_model.model_matrix = glm.rotate(self.selected_model.model_matrix, glm.radians(angle), axis)
+            self.selected_model.model_matrix = glm.translate(self.selected_model.model_matrix, -model_pos)
+            self.selected_model.model_matrix = self.selected_model.model_matrix * self.transform_start_value
+        
+        elif self.transform_mode == 'scale':
+            # Scaling
+            scale_delta = 1.0 + dx * 5.0
+            
+            if scale_delta <= 0.01:  # Prevent negative/zero scale
+                scale_delta = 0.01
+            
+            if self.transform_axis_constraint == 'X':
+                scale_vec = glm.vec3(scale_delta, 1.0, 1.0)
+            elif self.transform_axis_constraint == 'Y':
+                scale_vec = glm.vec3(1.0, scale_delta, 1.0)
+            elif self.transform_axis_constraint == 'Z':
+                scale_vec = glm.vec3(1.0, 1.0, scale_delta)
+            else:
+                # Uniform scaling
+                scale_vec = glm.vec3(scale_delta)
+            
+            self.selected_model.model_matrix = glm.scale(self.selected_model.model_matrix, scale_vec)
+    
+    def handle_mouse_click(self, mouse_x, mouse_y, button):
+        """Handle mouse click for selection"""
+        if button == 1:  # Left mouse button
+            if self.transform_active:
+                # If transform is active, left click confirms it
+                self.confirm_transform()
+            else:
+                # Otherwise, try to select a model
+                picked = self.pick_model(mouse_x, mouse_y)
+                if picked:
+                    self.selected_model = picked
+                    print(f"Model selected")
+                else:
+                    self.selected_model = None
+                    print("Deselected")
+            return True
+        return False
+    
+    def handle_key_press(self, key):
+        """Handle keyboard input for transform operations"""
+        # Check for Ctrl modifier
+        mods = pygame.key.get_mods()
+        ctrl_pressed = mods & pygame.KMOD_CTRL
+        
+        # Ctrl+D: Duplicate selected model
+        if key == pygame.K_d and ctrl_pressed:
+            if self.selected_model and not self.transform_active:
+                duplicated = self.duplicate_model(self.selected_model)
+                if duplicated:
+                    self.selected_model = duplicated
+                    print(f"Duplicated model: {duplicated.name}")
+                    # Update UI if available
+                    if self.control_panel:
+                        self.control_panel.update_scene_list([
+                            getattr(m, 'name', f'Model {i}') 
+                            for i, m in enumerate(self.models)
+                        ])
+            return True
+        
+        # F2: Rename selected model
+        elif key == pygame.K_F2:
+            if self.selected_model and not self.transform_active:
+                # Trigger rename in UI
+                if self.control_panel:
+                    self.control_panel.show_rename_dialog(self.selected_model)
+            return True
+        
+        elif key == pygame.K_g:
+            if not self.transform_active:
+                self.start_transform('move')
+            return True
+        
+        elif key == pygame.K_r:
+            if not self.transform_active:
+                self.start_transform('rotate')
+            return True
+        
+        elif key == pygame.K_s:
+            if not self.transform_active:
+                self.start_transform('scale')
+            return True
+        
+        elif key == pygame.K_x:
+            if self.transform_active:
+                if self.transform_axis_constraint == 'X':
+                    # Delete if X pressed twice
+                    self.cancel_transform()
+                    self.delete_selected_model()
+                else:
+                    self.set_axis_constraint('X')
+            else:
+                # Delete model
+                self.delete_selected_model()
+            return True
+        
+        elif key == pygame.K_y:
+            if self.transform_active:
+                self.set_axis_constraint('Y')
+            return True
+        
+        elif key == pygame.K_z:
+            if self.transform_active:
+                self.set_axis_constraint('Z')
+            return True
+        
+        elif key == pygame.K_RETURN or key == pygame.K_KP_ENTER:
+            if self.transform_active:
+                self.confirm_transform()
+            return True
+        
+        elif key == pygame.K_ESCAPE:
+            if self.transform_active:
+                self.cancel_transform()
+            elif self.selected_model:
+                self.selected_model = None
+                print("Deselected")
+            return True
+        
+        return False
